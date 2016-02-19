@@ -2,53 +2,121 @@
 
 # This file was installed by ansible from role osbs-master.
 
+import logging
 import os
 import re
 import shutil
-import syslog
+import sys
+import time
 
 import koji
+
+# How old failed tasks can be removed in seconds
+PRUNE_DELAY = 0
 
 SERVER = '{{ osbs_export_koji_hub }}'
 PARENT = '{{ osbs_export_dir }}'
 
+logger = None
 session = koji.ClientSession(SERVER)
 
+def set_logging(name="osbs-remove-finished-docker-tarball", level=logging.DEBUG, handler=None):
+    # create logger
+    global logger
+    logger = logging.getLogger(name)
+    logger.handlers = []
+    logger.setLevel(level)
 
-syslog.openlog('remove-finished-docker-tarball')
+    if not handler:
+        # create console handler and set level to debug
+        handler = logging.StreamHandler()
+        handler.setLevel(logging.DEBUG)
+
+        # create formatter
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+        # add formatter to ch
+        handler.setFormatter(formatter)
+
+    # add ch to logger
+    logger.addHandler(handler)
+
+
+handler = logging.handlers.SysLogHandler()
+set_logging(level=logging.DEBUG)
 
 for task_dir in os.listdir(PARENT):
     if not task_dir.startswith('task-'):
+        logger.debug("dir %s doesn't start with task- => skipping", task_dir)
         continue
 
     match = re.match('^task-(\d+)$', task_dir)
     if not match:
+        logger.debug("dir %s doesn't match regex => skipping", task_dir)
         continue
     task_id = int(match.group(1))
 
     if not task_id:
+        logger.debug("task_id %r isn't true (number) => skipping" % task_id)
         continue
+    logger.debug("Working with task_id %s", task_id)
 
     children_tasks = session.getTaskInfo(task_id)
     if 'parent' not in children_tasks or children_tasks['parent'] is None:
+        logger.debug("task doesn't have parents or it is none: %r => skipping", children_tasks)
         continue
+    children_tasks['state'] = koji.TASK_STATES.get(children_tasks['state'], 'BADSTATE')
+    if children_tasks['state'] not in ('CLOSED', 'CANCELED', 'FAILED'):
+        logger.debug("Task with state %s can still continue => skipping",
+                     children_tasks['state'])
+        continue
+
     parent_task_id = children_tasks['parent']
-    builds = session.listBuilds(taskID=parent_task_id)
+    logger.debug("Working with parent task_id %s", parent_task_id)
 
-    for build in builds:
-        build['state'] = koji.BUILD_STATES.get(build['state'], 'BADSTATE')
+    parent_task = session.getTaskInfo(parent_task_id)
+    parent_task['state'] = koji.TASK_STATES.get(parent_task['state'], 'BADSTATE')
+    if parent_task['state'] not in ('CLOSED', 'CANCELED', 'FAILED'):
+        logger.debug("Parent task with state %s can still continue => skipping",
+                     parent_task['state'])
+        continue
 
-        if build['state'] in ('BUILDING', 'BADSTATE'):
+    if parent_task['state'] in ('CANCELED', 'FAILED'):
+        logger.debug("Parent task in state %s is hardly going to get any results",
+                     parent_task['state'])
+        age = time.time() - parent_task['completion_ts']
+        if not PRUNE_DELAY:
+            logger.debug("PRUNE_DELAY not set => skipping")
             continue
-
-
-        image_msg = '%s %s %s' % (task_id, build['build_id'], build['state'])
+        if age < PRUNE_DELAY:
+            logger.debug("Task was completed in lower time %s which is lower than %s seconds => skipping" % (age, PRUNE_DELAY))
+            continue
+        image_msg = '%s task %s' % (task_id, parent_task['state'])
 
         full_path = os.path.join(PARENT, task_dir)
         try:
-            syslog.syslog('Removing %s (%s)' % (full_path, image_msg))
+            logger.info('Removing %s (%s)' % (full_path, image_msg))
             shutil.rmtree(full_path)
         except OSError, exception:
-            syslog.syslog('Failed to remove %s (%s): %s' % (full_path,
-                                                            image_msg,
-                                                            exception))
+            logger.error('Failed to remove %s (%s): %s' % (full_path, image_msg, exception))
+        continue
+
+    builds = session.listBuilds(taskID=parent_task_id)
+
+    for build in builds:
+        logger.debug("Working with build: %s" % build)
+        build['state'] = koji.BUILD_STATES.get(build['state'], 'BADSTATE')
+
+        if build['state'] in ('BUILDING', 'BADSTATE'):
+            logger.debug("Build has state %s we don't like => skipping" % build['state'])
+            continue
+
+
+        image_msg = '%s build %s %s' % (task_id, build['build_id'], build['state'])
+
+        full_path = os.path.join(PARENT, task_dir)
+        try:
+            logger.info('Removing %s (%s)' % (full_path, image_msg))
+            shutil.rmtree(full_path)
+        except OSError, exception:
+            logger.error('Failed to remove %s (%s): %s' % (full_path, image_msg, exception))
